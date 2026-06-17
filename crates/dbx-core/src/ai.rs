@@ -358,7 +358,12 @@ pub fn openai_stream_text(event: &serde_json::Value) -> Option<String> {
 pub fn openai_stream_reasoning(event: &serde_json::Value) -> Option<&str> {
     event["choices"]
         .get(0)
-        .and_then(|choice| choice["delta"]["reasoning_content"].as_str())
+        .and_then(|choice| {
+            choice["delta"]["reasoning_content"]
+                .as_str()
+                .or_else(|| choice["delta"]["reasoning"].as_str())
+                .or_else(|| choice["delta"]["thinking"].as_str())
+        })
         .filter(|text| !text.is_empty())
 }
 
@@ -1997,9 +2002,10 @@ pub fn load_config(path: &Path) -> Result<Option<AiConfig>, String> {
 mod tests {
     use super::{
         build_ai_http_client, claude_headers, claude_system_prompt, gemini_text, openai_response_text,
-        openai_stream_text, parse_model_list_response, resolve_endpoint, resolve_model_list_endpoint,
-        responses_max_output_tokens, responses_text, supports_temperature, validate_config, AiApiStyle, AiAuthMethod,
-        AiConfig, AiModelInfo, AiProvider, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM,
+        openai_stream_reasoning, openai_stream_text, parse_model_list_response, resolve_endpoint,
+        resolve_model_list_endpoint, responses_max_output_tokens, responses_text, supports_temperature,
+        validate_config, AiApiStyle, AiAuthMethod, AiConfig, AiModelInfo, AiProvider, AUTHORIZATION,
+        CLAUDE_DEFAULT_SYSTEM,
     };
 
     #[test]
@@ -2337,6 +2343,22 @@ mod tests {
             }))
             .as_deref(),
             Some("SELECT 2;")
+        );
+    }
+
+    #[test]
+    fn parses_ollama_openai_reasoning_stream_chunks() {
+        assert_eq!(
+            openai_stream_reasoning(&serde_json::json!({
+                "choices": [{ "delta": { "reasoning": "thinking..." } }]
+            })),
+            Some("thinking...")
+        );
+        assert_eq!(
+            openai_stream_reasoning(&serde_json::json!({
+                "choices": [{ "delta": { "thinking": "planning..." } }]
+            })),
+            Some("planning...")
         );
     }
 
