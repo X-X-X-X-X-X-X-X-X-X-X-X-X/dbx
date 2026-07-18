@@ -1,20 +1,57 @@
+use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind")]
 pub enum MongoCommand {
+    #[serde(rename = "version")]
     Version,
+    #[serde(rename = "use")]
+    Use { database: String },
+    #[serde(rename = "find")]
     Find { collection: String, filter: String, projection: Option<String>, sort: Option<String>, skip: u64, limit: i64 },
+    #[serde(rename = "findOne")]
+    FindOne { collection: String, filter: String, projection: Option<String>, options: Option<String> },
+    #[serde(rename = "countDocuments")]
     Count { collection: String, filter: String, accurate: bool },
+    #[serde(rename = "aggregate")]
     Aggregate { collection: String, pipeline: String, options: Option<String> },
+    #[serde(rename = "distinct")]
     Distinct { collection: String, field: String, filter: Option<String> },
+    #[serde(rename = "getIndexes")]
     GetIndexes { collection: String },
+    #[serde(rename = "collectionStats")]
     CollectionStats { collection: String, metric: String, scale: Option<serde_json::Number> },
-    Insert { collection: String, documents: String },
+    #[serde(rename = "insert")]
+    Insert {
+        collection: String,
+        #[serde(rename = "docsJson")]
+        documents: String,
+    },
+    #[serde(rename = "update")]
     Update { collection: String, filter: String, update: String, options: Option<String>, many: bool },
+    #[serde(rename = "delete")]
     Delete { collection: String, filter: String, many: bool },
+    #[serde(rename = "createIndex")]
     CreateIndex { collection: String, keys: String, options: Option<String> },
+    #[serde(rename = "dropIndexes")]
     DropIndexes { collection: String, indexes: Option<String>, single: bool },
+    #[serde(rename = "dropCollection")]
     DropCollection { collection: String },
+    #[serde(rename = "findOneAndUpdate")]
+    FindOneAndUpdate { collection: String, filter: String, update: String, options: Option<String> },
+    #[serde(rename = "findOneAndReplace")]
+    FindOneAndReplace { collection: String, filter: String, replacement: String, options: Option<String> },
+    #[serde(rename = "findOneAndDelete")]
+    FindOneAndDelete { collection: String, filter: String, options: Option<String> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MongoSafetyError {
+    WritesDisabled,
+    EmptyFilter,
+    Dangerous,
+    ProductionWrite,
 }
 
 impl MongoCommand {
@@ -27,6 +64,9 @@ impl MongoCommand {
                 | Self::CreateIndex { .. }
                 | Self::DropIndexes { .. }
                 | Self::DropCollection { .. }
+                | Self::FindOneAndUpdate { .. }
+                | Self::FindOneAndReplace { .. }
+                | Self::FindOneAndDelete { .. }
         ) || matches!(self, Self::Aggregate { pipeline, .. } if aggregate_writes(pipeline))
     }
 
@@ -38,16 +78,44 @@ impl MongoCommand {
 
     pub fn has_empty_filter(&self) -> bool {
         match self {
-            Self::Update { filter, .. } | Self::Delete { filter, .. } => is_empty_object(filter),
+            Self::Update { filter, .. }
+            | Self::Delete { filter, .. }
+            | Self::FindOneAndUpdate { filter, .. }
+            | Self::FindOneAndReplace { filter, .. }
+            | Self::FindOneAndDelete { filter, .. } => is_empty_object(filter),
             _ => false,
         }
     }
+}
+
+pub fn validate_safety(
+    command: &MongoCommand,
+    allow_writes: bool,
+    allow_dangerous: bool,
+    production_database: bool,
+) -> Result<(), MongoSafetyError> {
+    if command.is_mutating() && !allow_writes {
+        return Err(MongoSafetyError::WritesDisabled);
+    }
+    if command.has_empty_filter() && !allow_dangerous {
+        return Err(MongoSafetyError::EmptyFilter);
+    }
+    if command.is_dangerous() && !allow_dangerous {
+        return Err(MongoSafetyError::Dangerous);
+    }
+    if command.is_mutating() && production_database {
+        return Err(MongoSafetyError::ProductionWrite);
+    }
+    Ok(())
 }
 
 pub fn parse(input: &str) -> Result<MongoCommand, String> {
     let source = input.trim().trim_end_matches(';').trim();
     if source.eq_ignore_ascii_case("db.version()") {
         return Ok(MongoCommand::Version);
+    }
+    if let Some(database) = parse_use_database(source) {
+        return Ok(MongoCommand::Use { database });
     }
     let (collection, prefix_end) = parse_collection_prefix(source)?;
 
@@ -73,6 +141,44 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
             }
         }
         return Ok(MongoCommand::Find { collection, filter, projection, sort, skip, limit });
+    }
+
+    if let Some((args, tail)) = method_call(source, prefix_end, "findOne") {
+        if !tail.is_empty() || args.len() > 3 {
+            return Err("Invalid MongoDB findOne() command.".to_string());
+        }
+        return Ok(MongoCommand::FindOne {
+            collection,
+            filter: normalized_json(args.first().map(String::as_str).unwrap_or("{}"))?,
+            projection: optional_json_argument(args.get(1))?,
+            options: optional_json_argument(args.get(2))?,
+        });
+    }
+
+    for method in ["findOneAndUpdate", "findOneAndReplace"] {
+        if let Some((args, tail)) = method_call(source, prefix_end, method) {
+            if !tail.is_empty() || !(2..=3).contains(&args.len()) {
+                return Err(format!("Invalid MongoDB {method}() command."));
+            }
+            let filter = normalized_json(&args[0])?;
+            let value = normalized_json(&args[1])?;
+            let options = optional_json_argument(args.get(2))?;
+            return Ok(if method == "findOneAndUpdate" {
+                MongoCommand::FindOneAndUpdate { collection, filter, update: value, options }
+            } else {
+                MongoCommand::FindOneAndReplace { collection, filter, replacement: value, options }
+            });
+        }
+    }
+    if let Some((args, tail)) = method_call(source, prefix_end, "findOneAndDelete") {
+        if !tail.is_empty() || !(1..=2).contains(&args.len()) {
+            return Err("Invalid MongoDB findOneAndDelete() command.".to_string());
+        }
+        return Ok(MongoCommand::FindOneAndDelete {
+            collection,
+            filter: normalized_json(&args[0])?,
+            options: optional_json_argument(args.get(1))?,
+        });
     }
 
     for (method, accurate) in [("countDocuments", true), ("count", false)] {
@@ -149,6 +255,18 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
         let documents = normalized_json(&args[0])?;
         if !parse_json_value(&documents).is_some_and(|value| value.is_array()) {
             return Err("MongoDB insertMany() requires an array.".to_string());
+        }
+        return Ok(MongoCommand::Insert { collection, documents });
+    }
+    // MongoDB keeps insert() for legacy shell compatibility; preserve its
+    // single-document-or-array contract without silently ignoring options.
+    if let Some((args, tail)) = method_call(source, prefix_end, "insert") {
+        if !tail.is_empty() || args.len() != 1 {
+            return Err("Invalid MongoDB insert() command.".to_string());
+        }
+        let documents = normalized_json(&args[0])?;
+        if !parse_json_value(&documents).is_some_and(|value| value.is_object() || value.is_array()) {
+            return Err("MongoDB insert() requires a document or document array.".to_string());
         }
         return Ok(MongoCommand::Insert { collection, documents });
     }
@@ -338,6 +456,25 @@ fn parse_json_value(value: &str) -> Option<Value> {
     serde_json::from_str(value).ok()
 }
 
+fn optional_json_argument(value: Option<&String>) -> Result<Option<String>, String> {
+    value.filter(|value| !value.trim().is_empty()).map(|value| normalized_json(value)).transpose()
+}
+
+fn parse_use_database(source: &str) -> Option<String> {
+    let mut parts = source.split_whitespace();
+    if !parts.next()?.eq_ignore_ascii_case("use") {
+        return None;
+    }
+    let database = parts.next()?;
+    if parts.next().is_some()
+        || database.is_empty()
+        || !database.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return None;
+    }
+    Some(database.to_string())
+}
+
 fn is_empty_object(value: &str) -> bool {
     parse_json_value(value).is_some_and(|value| value.as_object().is_some_and(|object| object.is_empty()))
 }
@@ -478,6 +615,61 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(update, MongoCommand::Update { many: true, options: Some(_), .. }));
+    }
+
+    #[test]
+    fn accepts_legacy_insert_and_rejects_unsupported_options() {
+        assert_eq!(
+            parse(r#"db.getCollection("accounting_reconciliations").insert({accountId: 999, status: "done"})"#)
+                .unwrap(),
+            MongoCommand::Insert {
+                collection: "accounting_reconciliations".to_string(),
+                documents: r#"{"accountId":999,"status":"done"}"#.to_string(),
+            }
+        );
+        assert_eq!(
+            parse("db.products.insert([{name: 'first'}, {name: 'second'}])").unwrap(),
+            MongoCommand::Insert {
+                collection: "products".to_string(),
+                documents: r#"[{"name":"first"},{"name":"second"}]"#.to_string(),
+            }
+        );
+        assert!(parse("db.products.insert({name: 'demo'}, {writeConcern: {w: 1}})").is_err());
+        assert!(parse("db.products.insert()").is_err());
+        assert!(parse("db.products.insert('demo')").is_err());
+    }
+
+    #[test]
+    fn parses_desktop_find_one_find_and_modify_and_use_commands() {
+        assert_eq!(
+            parse("db.users.findOne({name: 'Ada'}, {_id: 0}, {maxTimeMS: 500})").unwrap(),
+            MongoCommand::FindOne {
+                collection: "users".to_string(),
+                filter: r#"{"name":"Ada"}"#.to_string(),
+                projection: Some(r#"{"_id":0}"#.to_string()),
+                options: Some(r#"{"maxTimeMS":500}"#.to_string()),
+            }
+        );
+        assert!(matches!(
+            parse("db.users.findOneAndUpdate({_id: 1}, {$set: {active: true}}, {returnDocument: 'after'})").unwrap(),
+            MongoCommand::FindOneAndUpdate { options: Some(_), .. }
+        ));
+        assert!(matches!(
+            parse("db.users.findOneAndReplace({_id: 1}, {name: 'Grace'})").unwrap(),
+            MongoCommand::FindOneAndReplace { .. }
+        ));
+        assert!(matches!(parse("db.users.findOneAndDelete({_id: 1})").unwrap(), MongoCommand::FindOneAndDelete { .. }));
+        assert_eq!(parse("use analytics-test").unwrap(), MongoCommand::Use { database: "analytics-test".to_string() });
+    }
+
+    #[test]
+    fn serializes_frontend_command_contract() {
+        let insert = serde_json::to_value(parse("db.items.insert({_id: 1})").unwrap()).unwrap();
+        assert_eq!(insert["kind"], "insert");
+        assert_eq!(insert["docsJson"], r#"{"_id":1}"#);
+        let count = serde_json::to_value(parse("db.items.count({})").unwrap()).unwrap();
+        assert_eq!(count["kind"], "countDocuments");
+        assert_eq!(count["accurate"], false);
     }
 
     #[test]

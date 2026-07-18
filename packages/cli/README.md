@@ -17,7 +17,7 @@ brew tap t8y2/dbx
 brew install dbx-cli
 ```
 
-Requires Node.js 22.13.0 or newer.
+The npm package installs the native CLI for the current platform automatically. Node.js 18.18.0 or newer is only needed for the npm launcher; direct native distributions do not require Node.js.
 
 ## Usage
 
@@ -90,22 +90,18 @@ Some CLI commands can run without DBX Desktop:
 - `query`
 - `context`
 
-Direct execution currently supports PostgreSQL/Redshift, MySQL-compatible databases (MySQL, Doris, StarRocks), and SQLite. Other database types use the DBX Desktop bridge until their drivers are added to `@dbx-app/node-core`.
+Direct execution supports PostgreSQL/Redshift, MySQL-compatible databases (MySQL, Doris, StarRocks), and SQLite. Other database types use the DBX Desktop bridge or DBX Agent/JDBC infrastructure.
 
 Use `dbx doctor` to check whether the DBX connection database, connection table, native SQLite loader, and desktop bridge are available. Use `dbx capabilities` to list direct-query and bridge-required database types.
 
-If `dbx doctor` reports a `NODE_MODULE_VERSION` mismatch after switching Node.js versions, rebuild the native dependencies with the Node.js version you use to run `dbx`:
-
-```bash
-pnpm rebuild better-sqlite3 keytar --pending
-```
-
-For global npm installs, reinstall the CLI with the same Node.js version:
+If the optional platform package was not installed, reinstall without `--no-optional`:
 
 ```bash
 npm uninstall -g @dbx-app/cli
 npm install -g @dbx-app/cli
 ```
+
+The native CLI does not require `better-sqlite3` and is not coupled to the Node.js ABI.
 
 ## Error Codes
 

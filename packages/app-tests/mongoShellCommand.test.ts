@@ -10,6 +10,7 @@ import {
   mongoDistinctToQueryResult,
   mongoDocumentsToQueryResult,
   mongoIndexesToQueryResult,
+  normalizeRustMongoCommand,
   parseMongoAggregateCommand,
   parseMongoCollectionStatsCommand,
   parseMongoCommand,
@@ -37,6 +38,21 @@ test("parseMongoFindCommand parses db collection find with an empty JSON filter"
     limit: 100,
     sort: undefined,
   });
+});
+
+test("normalizeRustMongoCommand preserves the desktop command contract", () => {
+  assert.deepEqual(
+    normalizeRustMongoCommand({ kind: "countDocuments", collection: "users", filter: "{}", accurate: false }),
+    { kind: "countDocuments", collection: "users", filter: "{}", mode: "legacy" },
+  );
+  assert.deepEqual(
+    normalizeRustMongoCommand({ kind: "dropIndexes", collection: "users", indexes: '"email_1"', single: true }),
+    { kind: "dropIndex", collection: "users", index: '"email_1"' },
+  );
+  assert.deepEqual(
+    normalizeRustMongoCommand({ kind: "findOne", collection: "users", filter: "{}", projection: null, options: null }),
+    { kind: "findOne", collection: "users", filter: "{}" },
+  );
 });
 
 test("parseMongoFindCommand parses getCollection find with chained sort skip and limit", () => {

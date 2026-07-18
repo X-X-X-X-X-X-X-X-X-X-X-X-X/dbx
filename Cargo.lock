@@ -1859,6 +1859,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbx-cli"
+version = "0.4.34"
+dependencies = [
+ "async-trait",
+ "dbx-core",
+ "dbx-mcp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "dbx-core"
 version = "0.1.0"
 dependencies = [
@@ -1877,6 +1890,7 @@ dependencies = [
  "font-kit",
  "futures",
  "iana-time-zone",
+ "json5",
  "jsonwebtoken",
  "log",
  "mongodb",
@@ -1915,7 +1929,6 @@ version = "0.4.34"
 dependencies = [
  "async-trait",
  "dbx-core",
- "json5",
  "reqwest 0.12.28",
  "rmcp",
  "schemars 1.2.1",
