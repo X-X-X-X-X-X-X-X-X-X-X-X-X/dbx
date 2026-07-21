@@ -9,6 +9,8 @@ const MAX_CANDIDATES = 3;
 const SEARCH_RESULT_LIMIT = 20;
 
 const ignoredSectionPatterns = [
+  /^来源$/i,
+  /^source$/i,
   /数据库类型/i,
   /database type/i,
   /支持信息/i,
