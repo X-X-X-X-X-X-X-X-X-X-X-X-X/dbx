@@ -500,6 +500,8 @@ export interface OwnerInfo {
 
 export interface QueryResult {
   columns: string[];
+  /** Internal marker for a result built by appending a page to existing rows. */
+  appended_from_row_count?: number;
   /** Set for synthesized query execution failures. */
   execution_error?: true;
   /** Zero-based index of the submitted statement that produced this result. */

@@ -131,6 +131,30 @@ function markQueryResultsRowsRaw(results: QueryResult[]): QueryResult[] {
   return results;
 }
 
+function appendQueryResultSegment(previous: QueryResult, segment: QueryResult, maxRows: number): QueryResult {
+  if (segment.execution_error) throw new Error(String(segment.rows[0]?.[0] ?? "Failed to load the next result segment"));
+  if (previous.columns.length !== segment.columns.length || previous.columns.some((column, index) => column !== segment.columns[index])) {
+    throw new Error("Result columns changed while loading the next segment");
+  }
+  const remainingRows = Math.max(0, maxRows - previous.rows.length);
+  const appendedRowCount = Math.min(remainingRows, segment.rows.length);
+  const appendParallelValues = <T>(existing: T[] | undefined, next: T[] | undefined): T[] | undefined => {
+    if (!existing && !next) return undefined;
+    return [...(existing ?? []), ...(next ?? []).slice(0, appendedRowCount)];
+  };
+  // Keep prior row objects intact so source-index based dirty/new/deleted state
+  // remains valid, while bounding the in-memory result by the configured cap.
+  return markQueryResultRowsRaw({
+    ...segment,
+    appended_from_row_count: previous.rows.length,
+    rows: [...previous.rows, ...segment.rows.slice(0, appendedRowCount)],
+    mongo_documents: appendParallelValues(previous.mongo_documents, segment.mongo_documents),
+    mongo_copy_documents: appendParallelValues(previous.mongo_copy_documents, segment.mongo_copy_documents),
+    execution_time_ms: (previous.execution_time_ms ?? 0) + (segment.execution_time_ms ?? 0),
+    has_more: previous.rows.length + appendedRowCount >= maxRows ? false : segment.has_more,
+  });
+}
+
 function markQueryResultRunsRowsRaw(resultRuns: NonNullable<QueryTab["resultRuns"]>): NonNullable<QueryTab["resultRuns"]> {
   for (const run of resultRuns) {
     if (run.result) markQueryResultRowsRaw(run.result);
@@ -2797,6 +2821,7 @@ export const useQueryStore = defineStore("query", () => {
         direction: "asc" | "desc";
       };
       pagination?: { limit: number; offset: number; sessionId?: string };
+      appendResult?: { maxRows: number };
       mongoSafety?: MongoAggregateSafetyOptions;
       preserveResultDuringExecution?: boolean;
       preserveTotalRowCountDuringExecution?: boolean;
@@ -3405,8 +3430,20 @@ export const useQueryStore = defineStore("query", () => {
       if (current?.executionId === executionId) {
         const activeGroupIndex = current.activeResultIndex;
         const activeGroupResults = current.results;
+        const shouldAppendResult = !!options?.appendResult && !!current.result;
         const shouldReplaceActiveResultInGroup = options?.replaceActiveResultInGroup === true && results.length === 1 && Array.isArray(activeGroupResults) && typeof activeGroupIndex === "number" && activeGroupIndex >= 0 && activeGroupIndex < activeGroupResults.length;
-        if (shouldReplaceActiveResultInGroup) {
+        if (shouldAppendResult) {
+          if (results.length !== 1) throw new Error("Expected one result while loading the next segment");
+          if (options.pagination?.offset !== current.result!.rows.length) {
+            throw new Error("Ignoring a stale result segment whose offset no longer matches the loaded rows");
+          }
+          const appendedResult = appendQueryResultSegment(current.result!, results[0]!, options.appendResult!.maxRows);
+          if (Array.isArray(activeGroupResults) && typeof activeGroupIndex === "number" && activeGroupIndex >= 0 && activeGroupIndex < activeGroupResults.length) {
+            current.results = activeGroupResults.slice();
+            current.results[activeGroupIndex] = appendedResult;
+          }
+          current.result = appendedResult;
+        } else if (shouldReplaceActiveResultInGroup) {
           current.results = activeGroupResults.slice();
           current.results[activeGroupIndex] = results[0];
           current.result = results[0];
@@ -3425,9 +3462,12 @@ export const useQueryStore = defineStore("query", () => {
         current.resultBaseSql = shouldReplaceActiveResultInGroup ? (current.resultBaseSql ?? queryBaseSql) : queryBaseSql;
         current.resultEditorFingerprint = shouldReplaceActiveResultInGroup ? (current.resultEditorFingerprint ?? executionEditorFingerprint) : executionEditorFingerprint;
         current.resultSortedSql = resultSortedSql;
-        current.resultPageSql = pageSql;
+        // Appended rows form one logical result starting at the original page.
+        // Keep the base page state so later table refresh/cache recovery does
+        // not re-execute only the most recently fetched tail segment.
+        current.resultPageSql = shouldAppendResult ? (current.resultPageSql ?? pageSql) : pageSql;
         current.resultPageLimit = pageLimit;
-        current.resultPageOffset = pageOffset;
+        current.resultPageOffset = shouldAppendResult ? (current.resultPageOffset ?? 0) : pageOffset;
         current.resultCountSql = countSql;
         current.resultSessionId = current.result?.session_id ?? undefined;
         if (!options?.preserveTotalRowCountDuringExecution) {
@@ -3451,7 +3491,7 @@ export const useQueryStore = defineStore("query", () => {
                 };
               })()
             : undefined;
-        const canAutoCalculateTotalRows = !!current.result && resultRowCount > 0 && !totalKnownFromIncompletePage && settingsStore.editorSettings.autoCalculateTotalRows && ((current.mode === "query" && !!countSql) || (current.mode === "data" && !!dataCountTarget));
+        const canAutoCalculateTotalRows = !options?.appendResult && !!current.result && resultRowCount > 0 && !totalKnownFromIncompletePage && settingsStore.editorSettings.autoCalculateTotalRows && ((current.mode === "query" && !!countSql) || (current.mode === "data" && !!dataCountTarget));
         current.resultTotalRowCountLoading = canAutoCalculateTotalRows;
         // Server-side pagination without a countSql: the backend (currently
         // the Elasticsearch driver) already reports the true match total via
@@ -3465,7 +3505,7 @@ export const useQueryStore = defineStore("query", () => {
         }
         touchResult(current);
         syncDisplayedResultRun(current, queryBaseSql);
-        if (!totalRowCountResolved && (current.mode === "query" || current.mode === "data") && current.result) {
+        if (!options?.appendResult && !totalRowCountResolved && (current.mode === "query" || current.mode === "data") && current.result) {
           countQueryTotalRowsInBackground({
             tabId: id,
             connectionId: current.connectionId,
@@ -3520,6 +3560,12 @@ export const useQueryStore = defineStore("query", () => {
       }
       const current = tabs.value.find((t) => t.id === id);
       if (current?.executionId === executionId) {
+        if (options?.appendResult && current.result) {
+          // A failed background segment must not replace the visible result or
+          // silently invalidate pending edits. The next explicit refresh can retry.
+          queryExecutionLog("warn", "append-result:preserved-after-error", { traceId, elapsed: elapsed() });
+          return;
+        }
         const errorResult = toErrorResult(e);
         const activeGroupIndex = current.activeResultIndex;
         const activeGroupResults = current.results;
